@@ -36,7 +36,12 @@ func (tracerImpl) EndOperationValidation(ctx context.Context) {
 
 func (tracerImpl) StartOperationExecution(ctx context.Context) context.Context {
 	requestContext := graphql.GetRequestContext(ctx)
-	span, ctx := opentracing.StartSpanFromContext(ctx, requestContext.RawQuery)
+	name := "unknown"
+	if len(requestContext.Doc.Operations) > 0 {
+		name = string(requestContext.Doc.Operations[0].Operation)
+	}
+
+	span, ctx := opentracing.StartSpanFromContext(ctx, name)
 	ext.SpanKind.Set(span, "server")
 	ext.Component.Set(span, "gqlgen")
 
