@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/99designs/gqlgen/graphql"
+	"github.com/prometheus/client_golang/prometheus"
 	prometheusclient "github.com/prometheus/client_golang/prometheus"
 )
 
@@ -13,82 +14,42 @@ const (
 	exitStatusSuccess  = "success"
 )
 
-var (
-	requestStartedCounter    prometheusclient.Counter
-	requestCompletedCounter  prometheusclient.Counter
-	resolverStartedCounter   *prometheusclient.CounterVec
-	resolverCompletedCounter *prometheusclient.CounterVec
-	timeToResolveField       *prometheusclient.HistogramVec
-	timeToHandleRequest      *prometheusclient.HistogramVec
-)
+func ResolverMiddleware(prom prometheus.Registerer) graphql.FieldMiddleware {
 
-func Register() {
-	requestStartedCounter = prometheusclient.NewCounter(
-		prometheusclient.CounterOpts{
-			Name: "graphql_request_started_total",
-			Help: "Total number of requests started on the graphql server.",
-		},
-	)
-
-	requestCompletedCounter = prometheusclient.NewCounter(
-		prometheusclient.CounterOpts{
-			Name: "graphql_request_completed_total",
-			Help: "Total number of requests completed on the graphql server.",
-		},
-	)
-
-	resolverStartedCounter = prometheusclient.NewCounterVec(
-		prometheusclient.CounterOpts{
-			Name: "graphql_resolver_started_total",
-			Help: "Total number of resolver started on the graphql server.",
+	resolverInflightGauge := prometheusclient.NewGaugeVec(
+		prometheusclient.GaugeOpts{
+			Name: "graphql_server_inflight_resolvers",
+			Help: "Active resolvers.",
 		},
 		[]string{"object", "field"},
 	)
 
-	resolverCompletedCounter = prometheusclient.NewCounterVec(
+	resolversCounter := prometheusclient.NewCounterVec(
 		prometheusclient.CounterOpts{
-			Name: "graphql_resolver_completed_total",
-			Help: "Total number of resolver completed on the graphql server.",
+			Name: "graphql_server_resovler_executions_total",
+			Help: "Total number of resolvers executed since start-up.",
 		},
 		[]string{"object", "field"},
 	)
 
-	timeToResolveField = prometheusclient.NewHistogramVec(prometheusclient.HistogramOpts{
-		Name:    "graphql_resolver_duration_ms",
+	timeToResolveField := prometheusclient.NewHistogramVec(prometheusclient.HistogramOpts{
+		Name:    "graphql_server_resolver_duration_ms",
 		Help:    "The time taken to resolve a field by graphql server.",
-		Buckets: prometheusclient.ExponentialBuckets(1, 2, 11),
+		Buckets: prometheusclient.ExponentialBuckets(0.001, 2, 4),
 	}, []string{"exitStatus"})
 
-	timeToHandleRequest = prometheusclient.NewHistogramVec(prometheusclient.HistogramOpts{
-		Name:    "graphql_request_duration_ms",
-		Help:    "The time taken to handle a request by graphql server.",
-		Buckets: prometheusclient.ExponentialBuckets(1, 2, 11),
-	}, []string{"exitStatus"})
-
-	prometheusclient.MustRegister(
-		requestStartedCounter,
-		requestCompletedCounter,
-		resolverStartedCounter,
-		resolverCompletedCounter,
+	prom.MustRegister(
+		resolverInflightGauge,
+		resolversCounter,
 		timeToResolveField,
-		timeToHandleRequest,
 	)
-}
 
-func UnRegister() {
-	prometheusclient.Unregister(requestStartedCounter)
-	prometheusclient.Unregister(requestCompletedCounter)
-	prometheusclient.Unregister(resolverStartedCounter)
-	prometheusclient.Unregister(resolverCompletedCounter)
-	prometheusclient.Unregister(timeToResolveField)
-	prometheusclient.Unregister(timeToHandleRequest)
-}
-
-func ResolverMiddleware() graphql.FieldMiddleware {
 	return func(ctx context.Context, next graphql.Resolver) (interface{}, error) {
 		rctx := graphql.GetResolverContext(ctx)
 
-		resolverStartedCounter.WithLabelValues(rctx.Object, rctx.Field.Name).Inc()
+		resolversCounter.WithLabelValues(rctx.Object, rctx.Field.Name).Inc()
+		resolverInflightGauge.WithLabelValues(rctx.Object, rctx.Field.Name).Inc()
+		defer resolverInflightGauge.WithLabelValues(rctx.Object, rctx.Field.Name).Dec()
 
 		observerStart := time.Now()
 
@@ -102,17 +63,42 @@ func ResolverMiddleware() graphql.FieldMiddleware {
 		}
 
 		timeToResolveField.With(prometheusclient.Labels{"exitStatus": exitStatus}).
-			Observe(float64(time.Since(observerStart).Nanoseconds() / int64(time.Millisecond)))
-
-		resolverCompletedCounter.WithLabelValues(rctx.Object, rctx.Field.Name).Inc()
+			Observe(float64(time.Since(observerStart)) / float64(time.Second))
 
 		return res, err
 	}
 }
 
-func RequestMiddleware() graphql.RequestMiddleware {
+func RequestMiddleware(prom prometheus.Registerer) graphql.RequestMiddleware {
+	requestsInflightGauge := prometheusclient.NewGauge(
+		prometheusclient.GaugeOpts{
+			Name: "graphql_server_inflight_requests",
+			Help: "Active requests.",
+		},
+	)
+
+	requestsCounter := prometheusclient.NewCounter(
+		prometheusclient.CounterOpts{
+			Name: "graphql_server_requests_total",
+			Help: "Total number of requests arrived since start-up.",
+		},
+	)
+
+	timeToHandleRequest := prometheusclient.NewHistogramVec(prometheusclient.HistogramOpts{
+		Name:    "graphql_server_request_duration_seconds",
+		Help:    "The time taken to handle a request by graphql server.",
+		Buckets: prometheusclient.ExponentialBuckets(0.001, 2, 4),
+	}, []string{"exitStatus"})
+	prometheusclient.MustRegister(
+		requestsInflightGauge,
+		requestsCounter,
+		timeToHandleRequest,
+	)
 	return func(ctx context.Context, next func(ctx context.Context) []byte) []byte {
-		requestStartedCounter.Inc()
+		requestsInflightGauge.Inc()
+		defer requestsInflightGauge.Dec()
+
+		requestsCounter.Inc()
 
 		observerStart := time.Now()
 
@@ -130,9 +116,7 @@ func RequestMiddleware() graphql.RequestMiddleware {
 		}
 
 		timeToHandleRequest.With(prometheusclient.Labels{"exitStatus": exitStatus}).
-			Observe(float64(time.Since(observerStart).Nanoseconds() / int64(time.Millisecond)))
-
-		requestCompletedCounter.Inc()
+			Observe(float64(time.Since(observerStart)) / float64(time.Second))
 
 		return res
 	}
